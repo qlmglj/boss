@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         BOSS直聘 · 自动打招呼
 // @namespace    https://www.zhipin.com/
-// @version      1.1.1
+// @version      1.2.0
 // @description  在职位列表里自动「立即沟通」打招呼：关键词过滤、随机间隔、每日上限、已沟通去重、试运行
 // @author       local
 // @match        https://www.zhipin.com/web/geek/jobs*
@@ -29,7 +29,7 @@
   /* ============================================================
    * 0. 常量与基础工具
    * ============================================================ */
-  const VERSION = '1.1.1';
+  const VERSION = '1.2.0';
   const IS_ZHIPIN = /(^|\.)zhipin\.com$/i.test(location.hostname);
   const TEST = !IS_ZHIPIN; // 本地仿站测试时走这个分支
   const PREFIX = 'bag.v1.';
@@ -143,6 +143,7 @@
     exclude: '销售,客服,培训,招生,中介,保险,房产,兼职,日结,推广,运营助理,电销',
     minSalaryK: 0,        // 薪资下限（K），0=不限
     blacklist: '',        // 公司黑名单，逗号分隔
+    cities: '广州,深圳',   // 城市白名单，逗号分隔，命中所在地才打招呼；留空=不限
     skipGreeted: true,    // 跳过本地记录里打过招呼的职位
     dryRun: false,        // 试运行：只点开看筛选结果，不点「立即沟通」
     longRestEvery: 10,    // 每发 N 条长休息一次
@@ -215,8 +216,79 @@
     return p || a;
   }
 
-  /** 解析 "7-8K·13薪" / "4-8K" / "面议" */
-  function salaryMax(s) {
+  /* ---------- 城市 ---------- */
+
+  /** 常见城市名，用来在详情页里"认出"是哪个城市（只用于判定，不做白名单） */
+  const KNOWN_CITIES = (
+    '北京,上海,天津,重庆,广州,深圳,杭州,南京,苏州,无锡,常州,徐州,南通,扬州,镇江,盐城,淮安,宿迁,泰州,连云港,' +
+    '宁波,温州,绍兴,嘉兴,金华,台州,湖州,丽水,衢州,舟山,' +
+    '成都,绵阳,德阳,宜宾,泸州,南充,乐山,' +
+    '武汉,宜昌,襄阳,荆州,十堰,黄石,' +
+    '西安,咸阳,宝鸡,榆林,' +
+    '郑州,洛阳,开封,新乡,许昌,商丘,南阳,信阳,周口,驻马店,平顶山,安阳,焦作,濮阳,漯河,三门峡,鹤壁,' +
+    '长沙,株洲,湘潭,衡阳,岳阳,常德,郴州,邵阳,' +
+    '东莞,佛山,珠海,中山,惠州,汕头,江门,湛江,肇庆,清远,韶关,梅州,河源,阳江,茂名,云浮,潮州,揭阳,汕尾,' +
+    '厦门,福州,泉州,漳州,莆田,三明,南平,龙岩,宁德,' +
+    '合肥,芜湖,蚌埠,安庆,阜阳,马鞍山,' +
+    '南昌,赣州,九江,上饶,宜春,吉安,景德镇,萍乡,新余,鹰潭,' +
+    '济南,青岛,烟台,潍坊,临沂,淄博,威海,济宁,泰安,德州,聊城,菏泽,日照,东营,滨州,枣庄,' +
+    '大连,沈阳,鞍山,抚顺,本溪,丹东,锦州,营口,' +
+    '长春,吉林,哈尔滨,齐齐哈尔,大庆,牡丹江,' +
+    '石家庄,保定,唐山,秦皇岛,邯郸,廊坊,沧州,邢台,衡水,张家口,承德,' +
+    '太原,大同,临汾,运城,晋中,' +
+    '昆明,贵阳,南宁,柳州,桂林,海口,三亚,兰州,西宁,银川,乌鲁木齐,呼和浩特,包头,鄂尔多斯,拉萨'
+  ).split(',');
+
+  /** 去掉「市」，统一成 "广州" 这种两字形式 */
+  function normCity(s) {
+    return String(s || '').replace(/[市\s]/g, '');
+  }
+
+  function parseCities() {
+    return parseList(cfg.cities).map(normCity).filter(Boolean);
+  }
+
+  /**
+   * 从卡片里读「地区」那一行，如 "广州·黄埔区"、"深圳-南山区"、"东莞"。
+   * 优先用卡片里的地区元素，读不到再在整张卡片文字里找 "XX·" 这种写法。
+   */
+  function cityOf(card, cardText) {
+    const el = card && card.querySelector(
+      '[class*="job-area"],[class*="area"],[class*="city"],[class*="location"],[class*="address"]'
+    );
+    const raw = el ? normText(textOf(el)) : '';
+    const m1 = raw.match(/^([\u4e00-\u9fa5]{2,6})(?:[·•\/\-—–]|$)/);
+    if (m1) return normCity(m1[1]);
+    const src = normText(raw || cardText || '');
+    const m2 = src.match(/([\u4e00-\u9fa5]{2,6})[·•][\u4e00-\u9fa5]{1,8}/);
+    if (m2) return normCity(m2[1]);
+    // 卡片上就一个光秃秃的城市名（少见）
+    if (raw && raw.length <= 6 && !/[\dK]/.test(raw)) return normCity(raw);
+    return '';
+  }
+
+  /**
+   * 右侧详情页显示的城市。
+   * 返回 { city, listed } —— listed=true 表示在白名单里，false 表示明确是别的城市，
+   * city 为空表示没认出来（这时不拦，交给卡片那一层判断）。
+   */
+  function detailCityVerdict() {
+    const cities = parseCities();
+    const root = detailRoot();
+    if (!root || !cities.length) return { city: '', listed: true, known: false };
+    // 只看顶部标题区域，避免把职位描述里提到的城市当成工作地
+    const head = root.querySelector(
+      '[class*="job-banner"],[class*="job-info"],[class*="job-primary"],[class*="info-primary"],[class*="job-header"]'
+    );
+    const t = normText(head ? textOf(head) : detailText().slice(0, 120));
+    const hit = cities.find((c) => t.includes(c));
+    if (hit) return { city: hit, listed: true, known: true };
+    const other = KNOWN_CITIES.find((c) => t.includes(c));
+    if (other) return { city: other, listed: false, known: true };
+    return { city: '', listed: true, known: false };
+  }
+
+  /** 解析 "7-8K·13薪" / "4-8K" / "面议" */  function salaryMax(s) {
     const t = String(s || '');
     const m = t.match(/(\d+(?:\.\d+)?)\s*-\s*(\d+(?:\.\d+)?)\s*[Kk千]/);
     if (m) return Number(m[2]);
@@ -243,6 +315,7 @@
         title,
         salary,
         company: comEl ? textOf(comEl) : '',
+        city: cityOf(card, cardText),
         cardText,
         el: card,
         link: a,
@@ -411,10 +484,16 @@
     const inc = parseList(cfg.include);
     const exc = parseList(cfg.exclude);
     const blk = parseList(cfg.blacklist);
+    const cities = parseCities();
     const title = job.title || '';
     const company = job.company || '';
     const hay = title + ' ' + company;
 
+    // 城市先判：卡片上能读出城市就直接卡掉，读不出就放行（进详情后再确认一次）
+    if (cities.length && job.city) {
+      const ok = cities.some((c) => job.city.includes(c) || c.includes(job.city));
+      if (!ok) return `城市不符（${job.city}）`;
+    }
     if (inc.length && !inc.some((k) => hay.includes(k))) return '不含关键词';
     if (exc.some((k) => title.includes(k))) return '命中排除词';
     if (blk.some((k) => company.includes(k))) return '公司黑名单';
@@ -532,6 +611,7 @@
               <div class="fld"><label>今日上限</label><input type="number" id="dailyCap" min="1" max="300"></div>
               <div class="fld"><label>本次上限</label><input type="number" id="runCap" min="1" max="300"></div>
               <div class="fld full"><label>必含关键词（逗号分隔，空=不限）</label><input type="text" id="include"></div>
+              <div class="fld full"><label>城市白名单（广州,深圳；空=不限）</label><input type="text" id="cities"></div>
               <div class="fld full"><label>排除关键词（只看职位名）</label><input type="text" id="exclude"></div>
               <div class="fld"><label>薪资下限（K，0=不限）</label><input type="number" id="minSalaryK" min="0" max="200"></div>
               <div class="fld"><label>每发 N 条长休息</label><input type="number" id="longRestEvery" min="0" max="100"></div>
@@ -649,6 +729,7 @@
       bind('dailyCap', 'dailyCap', 'num');
       bind('runCap', 'runCap', 'num');
       bind('include', 'include', 'text');
+      bind('cities', 'cities', 'text');
       bind('exclude', 'exclude', 'text');
       bind('minSalaryK', 'minSalaryK', 'num');
       bind('longRestEvery', 'longRestEvery', 'num');
@@ -667,6 +748,7 @@
       s.getElementById('dailyCap').value = cfg.dailyCap;
       s.getElementById('runCap').value = cfg.runCap;
       s.getElementById('include').value = cfg.include || '';
+      s.getElementById('cities').value = cfg.cities || '';
       s.getElementById('exclude').value = cfg.exclude || '';
       s.getElementById('minSalaryK').value = cfg.minSalaryK;
       s.getElementById('longRestEvery').value = cfg.longRestEvery;
@@ -917,6 +999,12 @@
 
       await sleep(rand(300, 700));
 
+      // 卡片上没读出城市时，进详情再确认一次（读出来是外地就跳过，不点沟通）
+      const v = detailCityVerdict();
+      if (v.known && !v.listed) {
+        return { status: 'skip', reason: `城市不符（详情显示 ${v.city}）` };
+      }
+
       const btn = findChatButton();
       if (!btn) {
         if (/继续沟通/.test(detailText())) return { status: 'skip', reason: '已沟通过' };
@@ -1019,9 +1107,14 @@
   function selfCheck() {
     const cards = scanCards();
     const btn = findChatButton();
+    const cities = parseCities();
     log('info', `自检：列表 ${cards.length} 个职位，详情按钮 ${btn ? '「' + textOf(btn) + '」' : '未找到'}`);
-    cards.slice(0, 6).forEach((c) => log('info', `  · ${c.title} | ${c.salary || '-'} | ${c.company || '-'}`));
+    log('info', `城市白名单：${cities.length ? cities.join('/') : '不限'}；详情页识别到：${detailCityVerdict().city || '未识别'}`);
+    cards.slice(0, 8).forEach((c) => log('info', `  · ${c.title} | ${c.salary || '-'} | ${c.company || '-'} | ${c.city || '城市未知'}`));
     if (!btn) log('warn', '未找到「立即沟通」：请确认右侧已打开某个职位');
+    if (cities.length && cards.length && cards.every((c) => !c.city)) {
+      log('warn', '所有卡片都没读出城市：这一版的城市筛选会失效（外地职位也可能投到）。把这条日志发我，我加选择器。');
+    }
   }
 
   /* ============================================================
@@ -1059,6 +1152,8 @@
     start: () => runner.start(),
     stop: (r) => runner.stop(r || '手动停止'),
     scanCards,
+    cityOf,
+    detailCityVerdict,
     findChatButton,
     findDialog,
     selfCheck,
